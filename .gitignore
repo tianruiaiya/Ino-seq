@@ -1,0 +1,39 @@
+# Site-specific runtime configuration
+config/step01.env
+config/samples.tsv
+config/inoseq.env
+config/pairs.tsv
+
+# Analysis outputs and scheduler logs
+output/
+logs/
+*.out
+*.err
+
+# Large sequencing/alignment files
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bam
+*.bai
+*.csi
+*.cram
+*.crai
+*.fai
+
+# Reproducibility files generated locally
+envs/*.lock.yml
+software_versions.tsv
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# OS/editor
+.DS_Store
+*.swp
+*.swo
+*~

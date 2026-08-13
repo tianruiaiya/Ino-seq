@@ -1,0 +1,21 @@
+name: ino-seq
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python>=3.10
+  - pandas>=2.0
+  - scipy>=1.10
+  - pysam
+  - pyfaidx
+  - regex
+  - biopython
+  - openpyxl
+  - pytest
+  - ruff
+  - fastp
+  - cutadapt
+  - bwa
+  - samtools
+  - openjdk
+  - fgbio=2.5.0

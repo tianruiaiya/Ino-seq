@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# BEGIN INOSEQ OPTIONAL CONDA RE-EXEC
+: "${INOSEQ_AUTO_CONDA:=1}"
+: "${INOSEQ_CONDA_ENV:=ino-seq}"
+
+if [[ "$INOSEQ_AUTO_CONDA" == "1" \
+      && "${INOSEQ_CONDA_REEXEC:-0}" != "1" \
+      && "${CONDA_DEFAULT_ENV:-}" != "$INOSEQ_CONDA_ENV" ]]; then
+    if command -v conda >/dev/null 2>&1 \
+       && conda env list 2>/dev/null | awk '{print $1}' | grep -Fxq "$INOSEQ_CONDA_ENV"; then
+        exec env INOSEQ_CONDA_REEXEC=1 \
+            conda run --no-capture-output -n "$INOSEQ_CONDA_ENV" "$0" "$@"
+    fi
+fi
+# END INOSEQ OPTIONAL CONDA RE-EXEC
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_DIR=$SCRIPT_DIR
+
+usage() {
+    cat <<'USAGE'
+Ino-seq v1.0.0 unified command
+
+Official full-workflow path:
+  ./inoseq init [config_directory]
+  ./inoseq prepare-reference [config.env]
+  ./inoseq validate [samples.tsv] [pairs.tsv] [config.env]
+  ./inoseq plan [--from-stage STAGE] [samples.tsv] [pairs.tsv] [config.env]
+  ./inoseq submit [--from-stage STAGE] [samples.tsv] [pairs.tsv] [config.env]
+  ./inoseq status [samples.tsv pairs.tsv] [config.env]
+
+Resume controls:
+  --from-stage auto|module01|module02|module03|module04|module05|qc|finalize
+  --force                         Alias for --from-stage module01
+  ./inoseq adopt-existing [samples.tsv] [pairs.tsv] [config.env]
+
+Maintenance:
+  ./inoseq test
+  ./inoseq submit-phase-a [samples.tsv] [config.env]
+  ./inoseq submit-phase-b [pairs.tsv] [config.env]
+
+Defaults:
+  samples.tsv = config/samples.tsv
+  pairs.tsv   = config/pairs.tsv
+  config.env  = config/inoseq.env
+
+Phases:
+  Phase A  Per-sample processing (modules 01-02)
+  Phase B  Matched experimental/control detection (modules 03-05)
+  Phase C  Cohort summaries and final workflow verification
+
+"submit" resumes automatically by default. Use --from-stage for a controlled
+recomputation boundary.  "adopt-existing" is only for explicitly trusting
+complete outputs created before stage fingerprints were introduced.
+USAGE
+}
+
+default_samples="${PROJECT_DIR}/config/samples.tsv"
+default_pairs="${PROJECT_DIR}/config/pairs.tsv"
+default_config="${PROJECT_DIR}/config/inoseq.env"
+
+absolute_file() {
+    local path=$1
+    [[ -f "$path" ]] || { echo "[ERROR] File not found: $path" >&2; return 2; }
+    (cd "$(dirname "$path")" && printf '%s/%s\n' "$PWD" "$(basename "$path")")
+}
+
+init_config() {
+    local target_dir=${1:-"${PROJECT_DIR}/config"}
+    mkdir -p "$target_dir"
+    local source_name target_name source target
+    while IFS=$'\t' read -r source_name target_name; do
+        source="${PROJECT_DIR}/config/${source_name}"
+        target="${target_dir}/${target_name}"
+        [[ -f "$source" ]] || { echo "[ERROR] Template not found: $source" >&2; return 2; }
+        if [[ -e "$target" ]]; then
+            echo "[KEEP] Existing file was not overwritten: $target"
+        else
+            cp "$source" "$target"
+            echo "[CREATE] $target"
+        fi
+    done <<'TEMPLATES'
+inoseq.env.example	inoseq.env
+samples.example.tsv	samples.tsv
+pairs.example.tsv	pairs.tsv
+TEMPLATES
+    echo "[NEXT] Edit inoseq.env, samples.tsv and pairs.tsv, then run: ./inoseq validate"
+}
+
+show_status() {
+    local samples_file=$default_samples pairs_file=$default_pairs config_file=$default_config
+    if [[ $# -eq 1 ]]; then
+        config_file=$1
+    elif [[ $# -eq 3 ]]; then
+        samples_file=$1
+        pairs_file=$2
+        config_file=$3
+    elif [[ $# -ne 0 ]]; then
+        echo "[ERROR] status accepts either [config.env] or [samples.tsv pairs.tsv config.env]" >&2
+        return 2
+    fi
+    config_file=$(absolute_file "$config_file")
+    # shellcheck disable=SC1090
+    source "$config_file"
+    : "${OUTPUT_DIR:=output}"
+    : "${LOG_DIR:=logs}"
+    [[ "$OUTPUT_DIR" == /* ]] || OUTPUT_DIR="${PROJECT_DIR}/${OUTPUT_DIR}"
+    [[ "$LOG_DIR" == /* ]] || LOG_DIR="${PROJECT_DIR}/${LOG_DIR}"
+
+    local version
+    version=$(tr -d '[:space:]' < "${PROJECT_DIR}/VERSION")
+    echo "[INFO] Ino-seq version: ${version}"
+    echo "[INFO] Output directory: ${OUTPUT_DIR}"
+    echo "[INFO] Log directory: ${LOG_DIR}"
+
+    if [[ -f "${OUTPUT_DIR}/INOSEQ_WORKFLOW_COMPLETE" ]]; then
+        echo "[STATUS] COMPLETED"
+    else
+        echo "[STATUS] NOT COMPLETED"
+    fi
+
+    if [[ -f "${OUTPUT_DIR}/QC/full_workflow_status.tsv" ]]; then
+        echo "[DETAIL] ${OUTPUT_DIR}/QC/full_workflow_status.tsv"
+        if command -v column >/dev/null 2>&1; then
+            column -t -s $'\t' "${OUTPUT_DIR}/QC/full_workflow_status.tsv"
+        else
+            sed -n '1,40p' "${OUTPUT_DIR}/QC/full_workflow_status.tsv"
+        fi
+    fi
+
+    if [[ -f "${LOG_DIR}/inoseq_last_full_workflow_job_id.txt" ]]; then
+        local final_job
+        final_job=$(tr -d '[:space:]' < "${LOG_DIR}/inoseq_last_full_workflow_job_id.txt")
+        echo "[JOB] Final Slurm job: ${final_job}"
+        echo "[HINT] sacct -j ${final_job} --format=JobID,JobName,State,ExitCode,Elapsed,MaxRSS"
+    fi
+    if [[ -f "${LOG_DIR}/inoseq_last_full_workflow_jobs.tsv" ]]; then
+        echo "[GRAPH] ${LOG_DIR}/inoseq_last_full_workflow_jobs.tsv"
+    fi
+
+    if [[ -f "$samples_file" && -f "$pairs_file" ]]; then
+        echo "[STAGES] resumable stage state"
+        "${PROJECT_DIR}/workflow/utils/report_stage_state.sh" \
+            "$samples_file" "$pairs_file" "$config_file"
+    fi
+}
+
+command_name=${1:-help}
+if [[ $# -gt 0 ]]; then shift; fi
+
+case "$command_name" in
+    help|-h|--help)
+        usage
+        ;;
+    version|--version)
+        printf 'Ino-seq v%s\n' "$(tr -d '[:space:]' < "${PROJECT_DIR}/VERSION")"
+        ;;
+    init)
+        [[ $# -le 1 ]] || { usage >&2; exit 2; }
+        init_config "${1:-}"
+        ;;
+    prepare-reference)
+        [[ $# -le 1 ]] || { usage >&2; exit 2; }
+        exec "${PROJECT_DIR}/workflow/utils/prepare_reference.sh" "${1:-$default_config}"
+        ;;
+    validate)
+        [[ $# -le 3 ]] || { usage >&2; exit 2; }
+        exec "${PROJECT_DIR}/workflow/utils/validate_full_workflow.sh" \
+            "${1:-$default_samples}" "${2:-$default_pairs}" "${3:-$default_config}"
+        ;;
+    plan)
+        export DRY_RUN=1
+        if [[ $# -eq 0 ]]; then
+            exec "${PROJECT_DIR}/workflow/submit_full_workflow.sh" \
+                "$default_samples" "$default_pairs" "$default_config"
+        fi
+        exec "${PROJECT_DIR}/workflow/submit_full_workflow.sh" "$@"
+        ;;
+    submit)
+        if [[ $# -eq 0 ]]; then
+            exec "${PROJECT_DIR}/workflow/submit_full_workflow.sh" \
+                "$default_samples" "$default_pairs" "$default_config"
+        fi
+        exec "${PROJECT_DIR}/workflow/submit_full_workflow.sh" "$@"
+        ;;
+    status)
+        [[ $# -eq 0 || $# -eq 1 || $# -eq 3 ]] || { usage >&2; exit 2; }
+        show_status "$@"
+        ;;
+    adopt-existing)
+        [[ $# -le 3 ]] || { usage >&2; exit 2; }
+        exec "${PROJECT_DIR}/workflow/utils/adopt_existing.sh" \
+            "${1:-$default_samples}" "${2:-$default_pairs}" "${3:-$default_config}"
+        ;;
+    test)
+        [[ $# -eq 0 ]] || { usage >&2; exit 2; }
+        cd "$PROJECT_DIR"
+        exec python -m pytest -q
+        ;;
+    submit-phase-a)
+        [[ $# -le 2 ]] || { usage >&2; exit 2; }
+        exec "${PROJECT_DIR}/workflow/submit_inoseq.sh" \
+            "${1:-$default_samples}" "${2:-$default_config}"
+        ;;
+    submit-phase-b)
+        [[ $# -le 2 ]] || { usage >&2; exit 2; }
+        exec "${PROJECT_DIR}/workflow/submit_postprocess.sh" \
+            "${1:-$default_pairs}" "${2:-$default_config}"
+        ;;
+    *)
+        echo "[ERROR] Unknown command: $command_name" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
